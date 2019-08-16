@@ -1,0 +1,352 @@
+#Library imports
+
+import sys
+import os
+from datetime import datetime, timedelta
+import pandas as pd
+import numpy as np
+from pvc import Dataset, load, query, preview
+from pvc.macros import LATEST_DS
+from bento import wait
+from analytics.bamboo import Bamboo as bb
+
+%matplotlib inline
+
+import matplotlib.pyplot as plt
+
+sys.path.insert(0, os.path.expanduser('~/fbsource/fbcode/analytics/utils'))
+
+sys.path.insert(0, os.path.expanduser('~/local/fbsource/fbcode/analytics/bootstrapped/bootstrapped'))
+
+from datetime import datetime, timedelta
+from dateutil import parser
+from datetime import date
+import datetime
+
+#import dependencies
+from pvc import Dataset, load, query
+import pandas as pd
+import datetime as dt
+import numpy as np
+import math
+import datetime
+
+from sklearn.model_selection import train_test_split
+from scipy.stats import ttest_ind
+from scipy.stats import levene
+from scipy.stats.mstats import winsorize
+from scipy import stats
+
+#Bootstrap
+import bootstrapped.bootstrap as bs
+import bootstrapped.stats_functions as bs_stats
+import bootstrapped.compare_functions as bs_compare
+
+
+query_start = '2019-05-13' #PCI Green Plurality start date of May 13th
+query_end = '2019-07-01'
+
+
+str_sql = """
+    SELECT
+        date_id,
+        ultimate_parent_sfid,
+        test_group,
+        COALESCE(SUM(rev_1d), 0) AS rev_1d,
+        COALESCE(SUM(active_1d), 0) AS accounts_active_1d,
+        COALESCE(SUM(total_decisions_1day), 0) total_decisions_1day,
+        COALESCE(SUM(approved_1day), 0) approved_1day,
+        COALESCE(SUM(disapproved_1day), 0) proactive_disapproved_1day,
+        COALESCE(SUM(reactive_disapproved_1day), 0) reactive_disapproved_1day,
+        COALESCE(SUM(overturned_1day), 0) AS overturned_1day,
+        COALESCE(COUNT(DISTINCT ad_account_id), 0) AS num_accounts,
+        COALESCE(SUM(account_disable), 0) AS account_disables_1day,
+        COALESCE(SUM(rbi), 0) AS rbi
+    FROM (
+        SELECT
+            date_id,
+            sf_id AS ultimate_parent_sfid,
+            ad_account_id,
+            test_group
+        FROM (
+            SELECT
+                sf_id,
+                ad_account_id,
+                test_group
+            FROM d_ad_account:edw_bir01 dad
+            JOIN pci_green_plurality_review_test_control USING (ad_account_id)
+            LEFT JOIN (
+                SELECT
+                    country_abbr
+                FROM global_country_mapping:edw_bir01
+                WHERE
+                    region = 'APAC'
+                    AND ds = '2019-06-30'
+            ) countries
+                ON country_code = country_abbr
+            WHERE
+                dad.ds = '<LATEST_DS:d_ad_account:edw_bir01>'
+                AND NOT (
+                    region = 'GAMING'
+                    AND country_abbr IS NOT NULL
+                )
+        )
+        JOIN (
+            SELECT
+                date_id
+            FROM d_date:bi
+            WHERE
+                date_id BETWEEN '{query_start}' AND '{query_end}'
+        )
+            ON 1 = 1
+    )
+    LEFT OUTER JOIN (
+            SELECT
+                date_id,
+                ad_account_id,
+                SUM(const_revenue_1d) AS rev_1d,
+                COUNT_IF(const_revenue_1d > 0) AS active_1d
+            FROM f_sales_revenue_rolling_agg:edw_bir01
+            WHERE
+                ds = '2019-04-01' --quarter start
+                AND date_id BETWEEN '{query_start}' AND '{query_end}'
+                AND const_revenue_1d > 0
+            GROUP BY
+                1, 2
+        ) USING (ad_account_id, date_id)
+    LEFT OUTER JOIN (
+            SELECT
+                ds AS date_id,
+                account_id AS ad_account_id,
+                total_decisions_1day,
+                approved_1day,
+                disapproved_1day,
+                reactive_disapproved_1day,
+                overturned_1day
+            FROM fct_ads_account_integrity
+            WHERE
+                ds BETWEEN '{query_start}' AND '{query_end}'
+        ) USING (ad_account_id, date_id)
+    LEFT OUTER JOIN (
+        SELECT 
+            ds AS date_id,
+            account_id AS ad_account_id,
+            1 AS account_disable
+        FROM ads_integrity_alr_actions
+        WHERE 
+            ds BETWEEN '{query_start}' AND '{query_end}'
+            AND action LIKE '%disable%'
+        GROUP BY ds, account_id
+    ) USING (ad_account_id, date_id)
+    LEFT OUTER JOIN (
+          SELECT 
+            ds AS date_id,
+            account_id AS ad_account_id,
+            SUM(rbi) AS rbi
+        FROM (
+            SELECT
+                ds,
+                account_id,
+                event_category,
+                -(SUM(event_cost)) AS rbi
+            FROM business_integrity_adex_score
+            WHERE
+                ds BETWEEN '{query_start}' AND '{query_end}'
+                AND (
+                    event_category IN (
+                        'tat',
+                        'text',
+                        'ad_overturn',
+                        'pas_task',
+                        'create_flow_warning',
+                        'disable_account'
+                    )
+                    OR (event IN ('proactive_reject_fp', 'reactive_reject_fp'))
+                )
+            GROUP BY
+                ds,
+                account_id,
+                event_category
+
+            UNION
+
+            SELECT
+                ds,
+                account_id,
+                'regrettable_ad_tp' AS event_category,
+                -(
+                    SUM(IF(event = 'regrettable_ad_reject', event_cost, 0)) - SUM(
+                        IF(event LIKE '%_fp', event_cost, 0)
+                    )
+                ) AS rbi
+            FROM business_integrity_adex_score
+            WHERE
+                ds BETWEEN '{query_start}' AND '{query_end}'
+                AND (
+                    event_category = 'regrettable_ad_reject'
+                    OR (event IN ('regrettable_proactive_reject_fp', 'regrettable_reactive_reject_fp'))
+                )
+            GROUP BY
+                ds,
+                account_id
+            )
+        GROUP BY
+            ds,
+            account_id
+    ) USING (ad_account_id, date_id)
+    GROUP BY
+        1, 2, 3
+""".format(query_start = query_start, query_end = query_end)
+
+df = bb.query_presto('ad_metrics', str_sql)
+
+print('EXERIMENT SIZE')
+print('control total units:', (df.query('test_group == "control"').ultimate_parent_sfid.nunique()))
+print('test total units:', (df.query('test_group == "test"').ultimate_parent_sfid.nunique()))
+
+test_grp  = df.test_group=='test'
+ctrl_grp = df.test_group=='control'
+
+def winsorize_and_test(df, metric_name):
+    test = df[test_grp].groupby('ultimate_parent_sfid')[metric_name].sum().values
+    control = df[~test_grp].groupby('ultimate_parent_sfid')[metric_name].sum().values
+    full_set = np.append(test, control)
+    
+    win_test = winsorize(test,
+                        limits=(0, 
+                             1 - stats.percentileofscore(
+                             test, 
+                             stats.scoreatpercentile(
+                                 full_set
+                                 , 99.95
+                             ),
+                             kind='mean'
+                            ) / 100.0 ), inclusive=(True, True))
+
+    win_ctrl = winsorize(control,
+                        limits=(0, 
+                             1 - stats.percentileofscore(
+                             control, 
+                             stats.scoreatpercentile(
+                                 full_set
+                                 , 99.95
+                             ),
+                             kind='mean'
+                            ) / 100.0 ), inclusive=(True, True))
+        
+    plt.plot(win_test,'ro', label='test')
+    plt.plot(win_ctrl, 'bo', label='control')
+    plt.legend()
+    plt.suptitle(metric_name)
+    plt.show()
+    
+    plt.plot(np.log(win_test+1), 'ro', label='test')
+    plt.plot(np.log(win_ctrl+1), 'bo', label='control')
+    plt.legend()
+    plt.suptitle(('log ' + metric_name))
+    plt.show()
+    
+    bootstrap_results = bs.bootstrap_ab(
+            win_test, 
+            win_ctrl,
+            bs_stats.sum, 
+            bs_compare.percent_change,
+            scale_test_by = len(control)*1.0/len(test),
+    )
+    
+    bootstrap_log_results = bs.bootstrap_ab(
+            np.log(win_test+1), 
+            np.log(win_ctrl+1),
+            bs_stats.sum, 
+            bs_compare.percent_change,
+            scale_test_by = len(control)*1.0/len(test),
+    )
+    
+    bootstrap_sum_results = bs.bootstrap_ab(
+            win_test, 
+            win_ctrl,
+            bs_stats.sum, 
+            bs_compare.difference,
+            scale_test_by = len(control)*1.0/len(test),
+    )
+    
+    bootstrap_mean_results = bs.bootstrap_ab(
+            win_test, 
+            win_ctrl,
+            bs_stats.mean, 
+            bs_compare.difference,
+            scale_test_by = len(control)*1.0/len(test),
+    )
+    
+    
+    bootstrap_log_mean_results = bs.bootstrap_ab(
+            np.log(win_test+1), 
+            np.log(win_ctrl+1),
+            bs_stats.mean, 
+            bs_compare.difference,
+            scale_test_by = len(control)*1.0/len(test),
+    )
+    
+    return {
+        "bs_results":bootstrap_results,
+        "bootstrap_log_results":bootstrap_log_results,
+        "bootstrap_sum_results":bootstrap_sum_results,
+        "bootstrap_mean_results":bootstrap_mean_results,
+        "bootstrap_log_mean_results":bootstrap_log_mean_results,
+        "control_mean":control.mean(),
+        "test_mean":test.mean(),
+        "control_log_mean":np.log(win_test+1).mean(),
+        "test_log_mean":np.log(win_ctrl+1).mean(),
+        "control_participants":len(control),
+        "test_participants":len(test),
+    }
+ metric_names=['rev_1d','proactive_disapproved_1day','approved_1day','accounts_active_1d', 'num_accounts', 'account_disables_1day','rbi']
+ results = []
+for metric in metric_names:
+    results.append(winsorize_and_test(df, metric))
+
+results_df = pd.DataFrame({
+    'metric': metric_names,
+    'test_mean': [round(result['test_mean'], 2) for result in results],
+    'control_mean': [round(result['control_mean'], 2) for result in results],
+    'pct_change': [round(result['bs_results'].value, 2) for result in results],
+    '95% CI': [(round(result['bs_results'].lower_bound, 2), 
+                round(result['bs_results'].upper_bound, 2)) for result in results],
+    'mean_change': [round(result['bootstrap_mean_results'].value, 2) 
+                    for result in results],
+    'test_log_mean': [round(result['test_log_mean'], 2) for result in results],
+    'control_log_mean': [round(result['control_log_mean'], 2) for result in results],
+    'pct_log_change': [round(result['bootstrap_log_results'].value, 2) for result in results],
+    'log 95% CI': [(round(result['bootstrap_log_results'].lower_bound, 2), 
+                round(result['bootstrap_log_results'].upper_bound, 2)) for result in results],
+    'mean_log_change': [round(result['bootstrap_log_mean_results'].value, 6) 
+                    for result in results]
+})
+
+results_df = results_df.set_index('metric')
+
+metric_names=['rev_1d','proactive_disapproved_1day','approved_1day','accounts_active_1d', 'num_accounts', 'account_disables_1day','rbi']
+
+results = []
+for metric in metric_names:
+    results.append(winsorize_and_test(df, metric))
+
+results_df = pd.DataFrame({
+    'metric': metric_names,
+    'test_mean': [round(result['test_mean'], 2) for result in results],
+    'control_mean': [round(result['control_mean'], 2) for result in results],
+    'pct_change': [round(result['bs_results'].value, 2) for result in results],
+    '95% CI': [(round(result['bs_results'].lower_bound, 2), 
+                round(result['bs_results'].upper_bound, 2)) for result in results],
+    'mean_change': [round(result['bootstrap_mean_results'].value, 2) 
+                    for result in results],
+    'test_log_mean': [round(result['test_log_mean'], 2) for result in results],
+    'control_log_mean': [round(result['control_log_mean'], 2) for result in results],
+    'pct_log_change': [round(result['bootstrap_log_results'].value, 2) for result in results],
+    'log 95% CI': [(round(result['bootstrap_log_results'].lower_bound, 2), 
+                round(result['bootstrap_log_results'].upper_bound, 2)) for result in results],
+    'mean_log_change': [round(result['bootstrap_log_mean_results'].value, 6) 
+                    for result in results]
+})
+
+results_df = results_df.set_index('metric')
